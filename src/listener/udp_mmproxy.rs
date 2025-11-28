@@ -119,7 +119,7 @@ async fn udp_handle_connection(
 
             let dst = {
                 let sock = util::udp_create_upstream_conn(src_addr, target_addr, args.mark).await?;
-                Arc::new(UdpProxyConn::new(sock))
+                Arc::new(UdpProxyConn::new(sock, vec![]))
             };
 
             let src_clone = src.clone();

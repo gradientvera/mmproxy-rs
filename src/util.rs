@@ -1,10 +1,10 @@
 use simple_eyre::eyre::{Result, WrapErr, eyre};
 
 use std::{
-    collections::HashMap, fs::File, io::{self, Read}, net::{IpAddr, SocketAddr}, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration
+    collections::HashMap, fs::File, io::{self, Read}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration
 };
 
-use proxy_protocol::{version1 as v1, version2 as v2, ProxyHeader};
+use proxy_protocol::{ProxyHeader, version1 as v1, version2::{self as v2, ProxyAddresses}};
 use socket2::{Domain, SockRef, Socket, Type};
 use tokio::{net::{TcpSocket, TcpStream, UdpSocket}, sync::mpsc, task::JoinHandle};
 
@@ -207,21 +207,56 @@ pub fn parse_proxy_protocol_header(mut buffer: &[u8]) -> ProxyProtocolResult {
     }
 }
 
+pub fn make_proxy_protocol_addresses(src_addr: SocketAddr, forward_addr: SocketAddr) -> ProxyAddresses {
+    let target_addr4 = match forward_addr {
+        SocketAddr::V4(v4) => v4,
+        SocketAddr::V6(v6) => SocketAddrV4::new(Ipv4Addr::LOCALHOST, v6.port()),
+    };
+    let target_addr6 = match forward_addr {
+        SocketAddr::V4(v4) => SocketAddrV6::new(Ipv6Addr::LOCALHOST, v4.port(), 0, 0),
+        SocketAddr::V6(v6) => v6,
+    };
+
+    match src_addr {
+        SocketAddr::V4(src_addr4) => {
+            ProxyAddresses::Ipv4 {
+                source: src_addr4,
+                destination: target_addr4
+            }
+        },
+        SocketAddr::V6(src_addr6) => {
+            // Ipv4-mapped
+            if let Some(mapped) = src_addr6.ip().to_ipv4_mapped() {
+                ProxyAddresses::Ipv4 {
+                    source: SocketAddrV4::new(mapped, src_addr.port()),
+                    destination: target_addr4
+                }
+            } else {
+                ProxyAddresses::Ipv6 {
+                    source: src_addr6,
+                    destination: target_addr6
+                }
+            }
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct UdpProxyConn {
     pub sock: UdpSocket,
     pub last_activity: AtomicU64,
+    pub pp_header: Arc<Vec<u8>>,
 }
 
 impl UdpProxyConn {
-    pub fn new(sock: UdpSocket) -> Self {
+    pub fn new(sock: UdpSocket, pp_header: Vec<u8>) -> Self {
         Self {
             sock,
             last_activity: AtomicU64::new(0),
+            pp_header: Arc::new(pp_header),
         }
     }
 }
-
 
 pub async fn udp_dst_to_src(
     addr: SocketAddr,
