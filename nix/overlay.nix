@@ -1,4 +1,4 @@
 final: prev:
 {
-  mmproxy-rs = final.callPackage ./nix/package.nix { };
+  mmproxy-rs = final.callPackage ./package.nix { };
 }
