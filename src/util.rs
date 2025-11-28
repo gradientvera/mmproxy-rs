@@ -1,15 +1,16 @@
-use simple_eyre::eyre::{Result, WrapErr};
+use simple_eyre::eyre::{Result, WrapErr, eyre};
 
 use std::{
-    fs::File,
-    io::{self, Read},
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
+    collections::HashMap, fs::File, io::{self, Read}, net::{IpAddr, SocketAddr}, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration
 };
 
 use proxy_protocol::{version1 as v1, version2 as v2, ProxyHeader};
 use socket2::{Domain, SockRef, Socket, Type};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::{net::{TcpSocket, TcpStream, UdpSocket}, sync::mpsc, task::JoinHandle};
+
+pub const MAX_DGRAM_SIZE: usize = 65_507;
+
+pub type ConnectionsHashMap = HashMap<SocketAddr, (Arc<UdpProxyConn>, JoinHandle<()>)>;
 
 // this is returned from `util::parse_proxy_protocol_header` function
 pub type ProxyProtocolResult<'a> = io::Result<(Option<(SocketAddr, SocketAddr)>, &'a [u8], i32)>;
@@ -55,7 +56,7 @@ pub fn parse_allowed_subnets(path: &str) -> io::Result<Vec<cidr::IpCidr>> {
     Ok(data)
 }
 
-fn setup_socket(socket_ref: &SockRef, src: SocketAddr, mark: u32) -> Result<()> {
+fn setup_socket_mmproxy(socket_ref: &SockRef, src: SocketAddr, mark: u32) -> Result<()> {
     // needs CAP_NET_ADMIN
     socket_ref
         .set_ip_transparent(true)
@@ -76,6 +77,17 @@ fn setup_socket(socket_ref: &SockRef, src: SocketAddr, mark: u32) -> Result<()> 
     Ok(())
 }
 
+fn setup_socket_reverse_proxy(socket_ref: &SockRef) -> Result<()> {
+    socket_ref
+        .set_nonblocking(true)
+        .wrap_err("failed to set nonblocking on the upstream socket")?;
+    socket_ref
+        .set_reuse_address(true)
+        .wrap_err("failed to set reuse address on the upstream socket")?;
+
+    Ok(())
+}
+
 pub async fn tcp_create_upstream_conn(
     src: SocketAddr,
     target: SocketAddr,
@@ -91,7 +103,7 @@ pub async fn tcp_create_upstream_conn(
     socket_ref
         .set_nodelay(true)
         .wrap_err("failed to set nodelay on the upstream socket")?;
-    setup_socket(&socket_ref, src, mark)?;
+    setup_socket_mmproxy(&socket_ref, src, mark)?;
 
     socket
         .connect(target)
@@ -110,7 +122,28 @@ pub async fn udp_create_upstream_conn(
     };
     let socket = socket.wrap_err("failed to create upstream socket")?;
 
-    setup_socket(&SockRef::from(&socket), src, mark)?;
+    setup_socket_mmproxy(&SockRef::from(&socket), src, mark)?;
+    let udp_socket = UdpSocket::from_std(socket.into())
+        .wrap_err("failed to cast socket2 socket to tokio socket")?;
+
+    udp_socket
+        .connect(target)
+        .await
+        .wrap_err("failed to connecto to the upstream server")?;
+
+    Ok(udp_socket)
+}
+
+pub async fn udp_create_reverse_proxy_conn(
+    target: SocketAddr
+) -> Result<UdpSocket> {
+    let socket = match target {
+        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::DGRAM, None),
+        SocketAddr::V6(_) => Socket::new(Domain::IPV6, Type::DGRAM, None),
+    };
+    let socket = socket.wrap_err("failed to create upstream socket")?;
+
+    setup_socket_reverse_proxy(&SockRef::from(&socket))?;
     let udp_socket = UdpSocket::from_std(socket.into())
         .wrap_err("failed to cast socket2 socket to tokio socket")?;
 
@@ -171,5 +204,61 @@ pub fn parse_proxy_protocol_header(mut buffer: &[u8]) -> ProxyProtocolResult {
             _ => unreachable!(),
         },
         Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
+    }
+}
+
+#[derive(Debug)]
+pub struct UdpProxyConn {
+    pub sock: UdpSocket,
+    pub last_activity: AtomicU64,
+}
+
+impl UdpProxyConn {
+    pub fn new(sock: UdpSocket) -> Self {
+        Self {
+            sock,
+            last_activity: AtomicU64::new(0),
+        }
+    }
+}
+
+
+pub async fn udp_dst_to_src(
+    addr: SocketAddr,
+    src_addr: SocketAddr,
+    src: Arc<UdpSocket>,
+    dst: Arc<UdpProxyConn>,
+) -> Result<()> {
+    let mut buffer = [0u8; MAX_DGRAM_SIZE];
+
+    loop {
+        let read_bytes = dst.sock.recv(&mut buffer).await?;
+        let sent_bytes = src.send_to(&buffer[..read_bytes], addr).await?;
+        if sent_bytes == 0 {
+            return Err(eyre!("couldn't sent anything to downstream"));
+        }
+        log::debug!("from [{}] to [{}], size: {}", addr, src_addr, sent_bytes);
+
+        dst.last_activity.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub async fn udp_close_after_inactivity(
+    addr: SocketAddr,
+    close_after: Duration,
+    tx: mpsc::Sender<SocketAddr>,
+    dst: Arc<UdpProxyConn>,
+) {
+    let mut last_activity = dst.last_activity.load(Ordering::SeqCst);
+    loop {
+        tokio::time::sleep(close_after).await;
+        if dst.last_activity.load(Ordering::SeqCst) == last_activity {
+            break;
+        }
+        last_activity = dst.last_activity.load(Ordering::SeqCst);
+    }
+
+    if let Err(why) = tx.send(addr).await {
+        log::error!("couldn't send the close command to conn channel: {why}");
     }
 }

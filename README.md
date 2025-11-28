@@ -1,6 +1,6 @@
 # mmproxy-rs
 
-A Rust implementation of MMProxy! 🚀
+Fork of the Rust implementation of mmproxy, adding reverse proxy support for UDP
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE.md)
 [![crates.io](https://img.shields.io/crates/v/mmproxy.svg)](https://crates.io/crates/mmproxy)
@@ -14,7 +14,7 @@ Another reason to choose mmproxy-rs may be if you want to avoid interference fro
 ## Features
 
 - [x] TCP - Accepts PROXY Protocol enabled requests from [Nginx](https://docs.nginx.com/nginx/admin-guide/load-balancer/using-proxy-protocol/#proxy-protocol-for-a-tcp-connection-to-an-upstream), [HAProxy](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
-- [x] UDP - Accepts PROXY Protocol enabled requests from [udppp](https://github.com/b23r0/udppp), [Cloudflare Spectrum](https://www.cloudflare.com/products/cloudflare-spectrum/)
+- [x] UDP - Accepts PROXY Protocol enabled requests from another instance of itself, [udppp](https://github.com/b23r0/udppp), [Cloudflare Spectrum](https://www.cloudflare.com/products/cloudflare-spectrum/)
 - [x] No Garbage Collection pauses
 
 ## Requirements
@@ -46,7 +46,7 @@ docker run ghcr.io/saiko-tech/mmproxy-rs:main --help
 ## Usage
 
 ```
-Usage: mmproxy [-h] [options]
+Usage: mmproxy mmproxy [-h] [options]
 
 Options:
   -h, --help              Prints the help string.
@@ -72,6 +72,29 @@ Options:
                           tcp)
   -m, --mark <n>          The mark that will be set on outbound packets.
                           (default: 0)
+```
+
+```
+Usage: mmproxy reverseproxy [-h] [options]
+
+Options:
+  -h, --help              Prints the help string.
+
+  -l, --listen-addr <string>
+                          Address the proxy listens on. "[::]" for dual-stack.
+                          (default: "[::]:443")
+
+
+  -f, --forward-addr <string>
+                          Address the proxy forwards to. (example:
+                          "10.0.0.2:444")
+
+  --listeners <n>         Number of listener sockets that will be opened for the
+                          listen address. (Linux 3.9+) (default: 1)
+  -c, --close-after <n>   Number of seconds after which UDP socket will be
+                          cleaned up. (default: 60)
+  -p, --protocol <p>      Protocol that will be proxied: tcp, udp. (default:
+                          tcp)
 ```
 
 ### Example

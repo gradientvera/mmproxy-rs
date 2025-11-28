@@ -4,7 +4,7 @@ mod pipe;
 mod util;
 
 use env_logger::{Env, DEFAULT_FILTER_ENV};
-use listener::{tcp, udp};
+use listener::{tcp_mmproxy, udp_mmproxy, tcp_reverseproxy, udp_reverseproxy};
 
 #[tokio::main]
 async fn main() {
@@ -18,9 +18,19 @@ async fn main() {
         }
     };
 
-    let ret = match args.protocol {
-        util::Protocol::Tcp => tcp::listen(args).await,
-        util::Protocol::Udp => udp::listen(args).await,
+    let ret = match args.command {
+        args::Command::mmproxy(args_mmproxy) => {
+            match args_mmproxy.protocol {
+                util::Protocol::Tcp => tcp_mmproxy::listen(args_mmproxy).await,
+                util::Protocol::Udp => udp_mmproxy::listen(args_mmproxy).await,
+            }
+        },
+        args::Command::reverseproxy(args_reverseproxy) => {
+            match args_reverseproxy.protocol {
+                util::Protocol::Tcp => todo!("Not supported yet! Use nginx or something"),
+                util::Protocol::Udp => udp_reverseproxy::listen(args_reverseproxy).await,
+            }
+        }
     };
 
     if let Err(why) = ret {

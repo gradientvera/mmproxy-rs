@@ -1,37 +1,25 @@
+use proxy_protocol::{ProxyHeader, version2};
 use simple_eyre::eyre::{eyre, Result, WrapErr};
 
-use crate::{args::Args, util};
+use crate::{
+    args::ArgsMmproxy,
+    util::{
+        self, MAX_DGRAM_SIZE, ConnectionsHashMap, UdpProxyConn,
+        udp_dst_to_src, udp_close_after_inactivity
+    },
+};
 use socket2::SockRef;
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, atomic::{AtomicU64, Ordering}
     },
     time::Duration,
 };
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
-const MAX_DGRAM_SIZE: usize = 65_507;
-type ConnectionsHashMap = HashMap<SocketAddr, (Arc<UdpProxyConn>, JoinHandle<()>)>;
-
-#[derive(Debug)]
-struct UdpProxyConn {
-    pub sock: UdpSocket,
-    pub last_activity: AtomicU64,
-}
-
-impl UdpProxyConn {
-    fn new(sock: UdpSocket) -> Self {
-        Self {
-            sock,
-            last_activity: AtomicU64::new(0),
-        }
-    }
-}
-
-pub async fn listen(args: Args) -> Result<()> {
+pub async fn listen(args: ArgsMmproxy) -> Result<()> {
     let socket = {
         let socket = UdpSocket::bind(args.listen_addr)
             .await
@@ -49,7 +37,7 @@ pub async fn listen(args: Args) -> Result<()> {
     let mut connections = ConnectionsHashMap::new();
     let (tx, mut rx) = mpsc::channel::<SocketAddr>(128);
 
-    log::info!("listening on: {}", args.listen_addr);
+    log::info!("mmproxy listening on: {}", args.listen_addr);
     loop {
         tokio::select! {
             // close inactive connections in this branch
@@ -92,7 +80,7 @@ pub async fn listen(args: Args) -> Result<()> {
 }
 
 async fn udp_handle_connection(
-    args: &Args,
+    args: &ArgsMmproxy,
     src: Arc<UdpSocket>,
     addr: SocketAddr,
     buffer: &mut [u8],
@@ -159,45 +147,5 @@ async fn udp_handle_connection(
             Ok(())
         }
         Err(err) => Err(err).wrap_err("failed to write data to the upstream connection"),
-    }
-}
-
-async fn udp_dst_to_src(
-    addr: SocketAddr,
-    src_addr: SocketAddr,
-    src: Arc<UdpSocket>,
-    dst: Arc<UdpProxyConn>,
-) -> Result<()> {
-    let mut buffer = [0u8; MAX_DGRAM_SIZE];
-
-    loop {
-        let read_bytes = dst.sock.recv(&mut buffer).await?;
-        let sent_bytes = src.send_to(&buffer[..read_bytes], addr).await?;
-        if sent_bytes == 0 {
-            return Err(eyre!("couldn't sent anything to downstream"));
-        }
-        log::debug!("from [{}] to [{}], size: {}", addr, src_addr, sent_bytes);
-
-        dst.last_activity.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-async fn udp_close_after_inactivity(
-    addr: SocketAddr,
-    close_after: Duration,
-    tx: mpsc::Sender<SocketAddr>,
-    dst: Arc<UdpProxyConn>,
-) {
-    let mut last_activity = dst.last_activity.load(Ordering::SeqCst);
-    loop {
-        tokio::time::sleep(close_after).await;
-        if dst.last_activity.load(Ordering::SeqCst) == last_activity {
-            break;
-        }
-        last_activity = dst.last_activity.load(Ordering::SeqCst);
-    }
-
-    if let Err(why) = tx.send(addr).await {
-        log::error!("couldn't send the close command to conn channel: {why}");
     }
 }

@@ -1,7 +1,7 @@
 use simple_eyre::eyre::{Result, WrapErr};
 
 use crate::{
-    args::Args,
+    args::ArgsMmproxy,
     pipe::{splice, wouldblock, Pipe, PIPE_BUF_SIZE},
     util,
 };
@@ -15,7 +15,7 @@ use tokio::{
     },
 };
 
-pub async fn listen(args: Args) -> Result<()> {
+pub async fn listen(args: ArgsMmproxy) -> Result<()> {
     let socket = match args.listen_addr {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
