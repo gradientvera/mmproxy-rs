@@ -68,6 +68,9 @@ fn setup_socket_mmproxy(socket_ref: &SockRef, src: SocketAddr, mark: u32) -> Res
         .set_reuse_address(true)
         .wrap_err("failed to set reuse address on the upstream socket")?;
     socket_ref
+        .set_reuse_port(true)
+        .wrap_err("failed to set reuse port on the upstream socket")?;
+    socket_ref
         .set_mark(mark)
         .wrap_err("failed to set mark on the upstream socket")?;
     socket_ref
@@ -84,7 +87,10 @@ fn setup_socket_reverse_proxy(socket_ref: &SockRef) -> Result<()> {
     socket_ref
         .set_reuse_address(true)
         .wrap_err("failed to set reuse address on the upstream socket")?;
-
+    socket_ref
+        .set_reuse_port(true)
+        .wrap_err("failed to set reuse port on the upstream socket")?;
+    
     Ok(())
 }
 
