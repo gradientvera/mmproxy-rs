@@ -11,13 +11,20 @@ in
 
     services.mmproxy-rs.mmproxies = lib.mkOption {
       default = {};
-      type = lib.types.attrsOf (lib.types.submodule {
+      type = lib.types.attrsOf (lib.types.submodule ({ name, config, ... }: {
         options = {
           enable = lib.mkOption {
             type = lib.types.bool;
             default = true;
             example = false;
             description = "Whether to enable this mmproxy-rs instance. Keep in mind this is true by default.";
+          };
+
+          enableRouting = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            example = false;
+            description = "Whether to enable the custom routing which makes this proxy work.";
           };
 
           ipv4 = lib.mkOption {
@@ -73,15 +80,21 @@ in
 
           mark = lib.mkOption {
             type = lib.types.int;
-            default = 0;
+            default = 100;
             example = 123;
-            description = "The mark that will be set on outbound packets";
+            description = "The mark that will be set on outbound packets, in case you need advanced routing";
+          };
+
+          table = lib.mkOption {
+            type = lib.types.int;
+            default = config.mark;
+            example = 123;
+            description = "The number of the routing table used for outbound packets";
           };
 
           openFirewall = lib.mkEnableOption "firewall rules to open the listen port";
         };
-
-      });
+      }));
     };
 
 
@@ -152,13 +165,14 @@ in
     };
 
     systemd.services = (lib.mapAttrs' (name: value: lib.nameValuePair "mmproxyrs-mmproxy-${name}" (
-      let
-        ipv4Addr = (lib.elemAt (lib.splitString ":" value.ipv4) 0);
-        ipv6Addr = lib.removePrefix "[" (lib.elemAt (lib.splitString "]" value.ipv6) 0);
-      in {
+    let
+      ipv4Addr = (lib.elemAt (lib.splitString ":" value.ipv4) 0);
+      ipv6Addr = lib.removePrefix "[" (lib.elemAt (lib.splitString "]" value.ipv6) 0);
+    in
+    {
       enable = value.enable;
       wantedBy = [ "multi-user.target" ];
-      path = [ pkgs.iproute2 pkgs.iptables ];
+      path = [ pkgs.iproute2 config.networking.firewall.package ];
       serviceConfig =
       let
         allowedSubnetsFile = toString (pkgs.writeText "mmproxyrs-${name}-allowed-subnets.txt" (lib.concatStringsSep "\n" value.allowedSubnets));
@@ -181,24 +195,32 @@ in
           ]);
         Restart = "on-failure";
       };
-      preStart = ''
-        ip rule add from ${ipv4Addr}/32 iif lo table ${toString value.mark}
-        ip -6 rule add from ${ipv6Addr}/128 iif lo table ${toString value.mark}
-        ip route add local 0.0.0.0/0 dev lo table ${toString value.mark}
-        ip -6 route add local ::0/0 dev lo table ${toString value.mark}
+      preStart = (lib.optionalString value.enableRouting ''
+        ip -4 rule add from ${ipv4Addr}/32 iif lo table ${toString value.table}
+        ip -6 rule add from ${ipv6Addr}/128 iif lo table ${toString value.table}
 
-        iptables -t mangle -A POSTROUTING -m mark --mark ${toString value.mark} -j CONNMARK --save-mark
-        iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
-      '';
-      postStop = ''
-        ip rule del from ${ipv4Addr}/32 iif lo table ${toString value.mark}
-        ip -6 rule del from ${ipv6Addr}/128 iif lo table ${toString value.mark}
-        ip route del local 0.0.0.0/0 dev lo table ${toString value.mark}
-        ip -6 route del local ::0/0 dev lo table ${toString value.mark}
+        ip route add local 0.0.0.0/0 dev lo table ${toString value.table}
+        ip -6 route add local ::0/0 dev lo table ${toString value.table}
+      '' + (lib.optionalString (config.networking.firewall.package.pname == "iptables") ''
+        iptables -t mangle -I PREROUTING -m mark --mark ${toString value.mark} -m comment --comment "mmproxy-${name}" -j CONNMARK --save-mark
+        ip6tables -t mangle -I PREROUTING -m mark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --save-mark
 
-        iptables -t mangle -D POSTROUTING -m mark --mark ${toString value.mark} -j CONNMARK --save-mark
-        iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark
-      '';
+        iptables -t mangle -I OUTPUT -m connmark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --restore-mark
+        ip6tables -t mangle -I OUTPUT -m connmark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --restore-mark
+      ''));
+      postStop = (lib.optionalString value.enableRouting ''
+        ip -4 rule del from ${ipv4Addr}/32 iif lo table ${toString value.table}
+        ip -6 rule del from ${ipv6Addr}/128 iif lo table ${toString value.table}
+
+        ip route del local 0.0.0.0/0 dev lo table ${toString value.table}
+        ip -6 route del local ::0/0 dev lo table ${toString value.table}
+      '' + (lib.optionalString (config.networking.firewall.package.pname == "iptables") ''
+        iptables -t mangle -D PREROUTING -m mark --mark ${toString value.mark} -m comment --comment "mmproxy-${name}" -j CONNMARK --save-mark
+        ip6tables -t mangle -D PREROUTING -m mark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --save-mark
+
+        iptables -t mangle -D OUTPUT -m connmark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --restore-mark
+        ip6tables -t mangle -D OUTPUT -m connmark --mark ${toString value.mark} -m comment --comment "mmproxy${name}" -j CONNMARK --restore-mark
+      ''));
     })) cfg.mmproxies) // 
     (lib.mapAttrs' (name: value: lib.nameValuePair "mmproxyrs-reverse-proxy-${name}" (
     {
