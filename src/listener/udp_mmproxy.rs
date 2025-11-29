@@ -1,4 +1,3 @@
-use proxy_protocol::{ProxyHeader, version2};
 use simple_eyre::eyre::{eyre, Result, WrapErr};
 
 use crate::{
@@ -8,30 +7,16 @@ use crate::{
         udp_dst_to_src, udp_close_after_inactivity
     },
 };
-use socket2::SockRef;
 use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::SocketAddr,
     sync::{
-        Arc, atomic::{AtomicU64, Ordering}
+        Arc, atomic::Ordering
     },
-    time::Duration,
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::mpsc};
 
 pub async fn listen(args: ArgsMmproxy) -> Result<()> {
-    let socket = {
-        let socket = UdpSocket::bind(args.listen_addr)
-            .await
-            .wrap_err_with(|| format!("failed to bind to {}", args.listen_addr))?;
-
-        let sock_ref = SockRef::from(&socket);
-        sock_ref
-            .set_reuse_port(args.listeners > 1)
-            .wrap_err("failed to set reuse port on listener socket")?;
-
-        Arc::new(socket)
-    };
+    let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
 
     let mut buffer = [0u8; MAX_DGRAM_SIZE];
     let mut connections = ConnectionsHashMap::new();
@@ -100,6 +85,7 @@ async fn udp_handle_connection(
             "proxy protocol version 1 doesn't support UDP connections"
         ));
     }
+
     let target_addr = match src_addr {
         SocketAddr::V4(_) => args.ipv4_fwd,
         SocketAddr::V6(_) => args.ipv6_fwd,
@@ -115,6 +101,7 @@ async fn udp_handle_connection(
             if src_addr == addr {
                 log::debug!("unknown source, using the downstream connection address");
             }
+
             log::info!("[new conn] [origin: {addr}] [src: {src_addr}]");
 
             let dst = {
@@ -124,11 +111,13 @@ async fn udp_handle_connection(
 
             let src_clone = src.clone();
             let dst_clone = dst.clone();
+
             let handle = tokio::spawn(async move {
                 if let Err(why) = udp_dst_to_src(addr, src_addr, src_clone, dst_clone).await {
                     log::error!("{why:#}");
                 };
             });
+
             tokio::spawn(udp_close_after_inactivity(
                 addr,
                 args.close_after,

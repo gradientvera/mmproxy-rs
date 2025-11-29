@@ -11,7 +11,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, ... }@args:
+  outputs = { nixpkgs, ... }:
     let
       forAllSystems = function:
         nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ]

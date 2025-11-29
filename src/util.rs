@@ -90,7 +90,7 @@ fn setup_socket_reverse_proxy(socket_ref: &SockRef) -> Result<()> {
     socket_ref
         .set_reuse_port(true)
         .wrap_err("failed to set reuse port on the upstream socket")?;
-    
+
     Ok(())
 }
 
@@ -214,20 +214,11 @@ pub fn parse_proxy_protocol_header(mut buffer: &[u8]) -> ProxyProtocolResult {
 }
 
 pub fn make_proxy_protocol_addresses(src_addr: SocketAddr, forward_addr: SocketAddr) -> ProxyAddresses {
-    let target_addr4 = match forward_addr {
-        SocketAddr::V4(v4) => v4,
-        SocketAddr::V6(v6) => SocketAddrV4::new(Ipv4Addr::LOCALHOST, v6.port()),
-    };
-    let target_addr6 = match forward_addr {
-        SocketAddr::V4(v4) => SocketAddrV6::new(Ipv6Addr::LOCALHOST, v4.port(), 0, 0),
-        SocketAddr::V6(v6) => v6,
-    };
-
     match src_addr {
         SocketAddr::V4(src_addr4) => {
             ProxyAddresses::Ipv4 {
                 source: src_addr4,
-                destination: target_addr4
+                destination: proxy_protocol_get_dest_v4(forward_addr)
             }
         },
         SocketAddr::V6(src_addr6) => {
@@ -235,15 +226,29 @@ pub fn make_proxy_protocol_addresses(src_addr: SocketAddr, forward_addr: SocketA
             if let Some(mapped) = src_addr6.ip().to_ipv4_mapped() {
                 ProxyAddresses::Ipv4 {
                     source: SocketAddrV4::new(mapped, src_addr.port()),
-                    destination: target_addr4
+                    destination: proxy_protocol_get_dest_v4(forward_addr)
                 }
             } else {
                 ProxyAddresses::Ipv6 {
                     source: src_addr6,
-                    destination: target_addr6
+                    destination: proxy_protocol_get_dest_v6(forward_addr)
                 }
             }
         },
+    }
+}
+
+fn proxy_protocol_get_dest_v4(addr: SocketAddr) -> SocketAddrV4 {
+    match addr {
+        SocketAddr::V4(v4) => v4,
+        SocketAddr::V6(v6) => SocketAddrV4::new(v6.ip().to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED), v6.port()),
+    }
+}
+
+fn proxy_protocol_get_dest_v6(addr: SocketAddr) -> SocketAddrV6 {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
+        SocketAddr::V6(v6) => v6,
     }
 }
 
@@ -262,6 +267,32 @@ impl UdpProxyConn {
             pp_header: Arc::new(pp_header),
         }
     }
+}
+
+pub async fn bind_udp_socket(listen_addr: SocketAddr, listeners: u32) -> Result<Arc<UdpSocket>> {
+    let domain = Domain::for_address(listen_addr);
+    let socket = socket2::Socket::new(domain, Type::DGRAM, Some(socket2::Protocol::UDP))
+        .wrap_err("failed to create new socket")?;
+
+    socket
+        .set_reuse_port(listeners > 1)
+        .wrap_err("failed to set reuse port on listener socket")?;
+
+
+    if domain == Domain::IPV6 && listen_addr.ip().is_unspecified() {
+        // dual-stack
+        socket
+            .set_only_v6(false)
+            .wrap_err("failed to set only v6 to false on listener socket")?;
+    }
+
+    socket.bind(&listen_addr.into())
+        .wrap_err(format!("failed to bind socket to address {}", listen_addr))?;
+
+    let socket = UdpSocket::from_std(socket.into())
+        .wrap_err("failed to create tokio socket")?;
+
+    Ok(Arc::new(socket))
 }
 
 pub async fn udp_dst_to_src(

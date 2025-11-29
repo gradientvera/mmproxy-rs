@@ -1,37 +1,23 @@
 use proxy_protocol::{ProxyHeader, version2};
-use simple_eyre::eyre::{eyre, Result, WrapErr};
+use simple_eyre::eyre::{Result, WrapErr};
 
 use crate::{
-    args::{ArgsMmproxy, ArgsReverseProxy},
+    args::ArgsReverseProxy,
     util::{
         self, ConnectionsHashMap, MAX_DGRAM_SIZE, UdpProxyConn,
         udp_close_after_inactivity, udp_dst_to_src, make_proxy_protocol_addresses
     },
 };
-use socket2::SockRef;
 use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::SocketAddr,
     sync::{
-        Arc, atomic::{AtomicU64, Ordering}
+        Arc, atomic::Ordering
     },
-    time::Duration,
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::mpsc};
 
 pub async fn listen(args: ArgsReverseProxy) -> Result<()> {
-    let socket = {
-        let socket = UdpSocket::bind(args.listen_addr)
-            .await
-            .wrap_err_with(|| format!("failed to bind to {}", args.listen_addr))?;
-
-        let sock_ref = SockRef::from(&socket);
-        sock_ref
-            .set_reuse_port(args.listeners > 1)
-            .wrap_err("failed to set reuse port on listener socket")?;
-
-        Arc::new(socket)
-    };
+    let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
 
     let mut buffer = [0u8; MAX_DGRAM_SIZE];
     let mut connections = ConnectionsHashMap::new();
