@@ -113,7 +113,7 @@ async fn udp_handle_connection(
             let dst_clone = dst.clone();
 
             let handle = tokio::spawn(async move {
-                if let Err(why) = udp_dst_to_src(addr, src_addr, src_clone, dst_clone).await {
+                if let Err(why) = udp_dst_to_src(addr, src_clone, dst_clone).await {
                     log::error!("{why:#}");
                 };
             });
@@ -132,6 +132,9 @@ async fn udp_handle_connection(
 
     match dst.sock.send(rest).await {
         Ok(size) => {
+            if size != rest.len() {
+                log::warn!("sent {} bytes to [{}] but received {} bytes from [{}]!", size, target_addr, rest.len(), src_addr);
+            }
             log::debug!("from [{}] to [{}], size: {}", src_addr, addr, size);
             Ok(())
         }

@@ -122,11 +122,9 @@ pub async fn udp_create_upstream_conn(
     target: SocketAddr,
     mark: u32,
 ) -> Result<UdpSocket> {
-    let socket = match src {
-        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::DGRAM, None),
-        SocketAddr::V6(_) => Socket::new(Domain::IPV6, Type::DGRAM, None),
-    };
-    let socket = socket.wrap_err("failed to create upstream socket")?;
+    let domain = Domain::for_address(target);
+    let socket = Socket::new(domain, Type::DGRAM, None)
+        .wrap_err("failed to create upstream socket")?;
 
     setup_socket_mmproxy(&SockRef::from(&socket), src, mark)?;
     let udp_socket = UdpSocket::from_std(socket.into())
@@ -143,11 +141,9 @@ pub async fn udp_create_upstream_conn(
 pub async fn udp_create_reverse_proxy_conn(
     target: SocketAddr
 ) -> Result<UdpSocket> {
-    let socket = match target {
-        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::DGRAM, None),
-        SocketAddr::V6(_) => Socket::new(Domain::IPV6, Type::DGRAM, None),
-    };
-    let socket = socket.wrap_err("failed to create upstream socket")?;
+    let domain = Domain::for_address(target);
+    let socket = Socket::new(domain, Type::DGRAM, None)
+        .wrap_err("failed to create upstream socket")?;
 
     setup_socket_reverse_proxy(&SockRef::from(&socket))?;
     let udp_socket = UdpSocket::from_std(socket.into())
@@ -162,7 +158,7 @@ pub async fn udp_create_reverse_proxy_conn(
 }
 
 // TODO: revise this
-pub fn parse_proxy_protocol_header(mut buffer: &[u8]) -> ProxyProtocolResult {
+pub fn parse_proxy_protocol_header(mut buffer: &[u8]) -> ProxyProtocolResult<'_> {
     match proxy_protocol::parse(&mut buffer) {
         Ok(result) => match result {
             ProxyHeader::Version1 { addresses } => match addresses {
@@ -297,7 +293,6 @@ pub async fn bind_udp_socket(listen_addr: SocketAddr, listeners: u32) -> Result<
 
 pub async fn udp_dst_to_src(
     addr: SocketAddr,
-    src_addr: SocketAddr,
     src: Arc<UdpSocket>,
     dst: Arc<UdpProxyConn>,
 ) -> Result<()> {
@@ -309,7 +304,10 @@ pub async fn udp_dst_to_src(
         if sent_bytes == 0 {
             return Err(eyre!("couldn't sent anything to downstream"));
         }
-        log::debug!("from [{}] to [{}], size: {}", addr, src_addr, sent_bytes);
+        if read_bytes != sent_bytes {
+            log::warn!("received {} bytes from [{}] but sent {} bytes to [{}]!", read_bytes, dst.sock.peer_addr().unwrap(), sent_bytes, addr)
+        }
+        log::debug!("from [{}] to [{}], size: {}", dst.sock.peer_addr().unwrap(), addr, sent_bytes);
 
         dst.last_activity.fetch_add(1, Ordering::SeqCst);
     }
