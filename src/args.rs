@@ -1,5 +1,6 @@
+
 use crate::util::{self, Protocol};
-use std::{net::{SocketAddr, SocketAddrV4}, time::Duration};
+use std::{net::SocketAddr, num::NonZero, thread::available_parallelism, time::Duration};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -41,7 +42,7 @@ argwerk::define! {
         pub close_after: Duration = Duration::from_secs(60),
         pub mark: u32 = 0,
         pub listen_addr: SocketAddr = "[::]:8443".parse().unwrap(),
-        pub listeners: u32 = 1,
+        pub listeners: u32 = 0,
         pub protocol: Protocol = Protocol::Tcp
     }
     /// Prints the help string.
@@ -70,9 +71,12 @@ argwerk::define! {
     ["-l" | "--listen-addr", string] => {
         listen_addr = string.parse()?;
     }
-    /// Number of listener sockets that will be opened for the listen address. (Linux 3.9+) (default: 1)
+    /// Number of listener sockets that will be opened for the listen address. 0 to automatically choose to a reasonable number. (Linux 3.9+) (default: 0)
     ["--listeners", n] => {
         listeners = str::parse(&n)?;
+        if listeners == 0 {
+            listeners = available_parallelism().unwrap_or(NonZero::new(1).unwrap()).get() as u32;
+        }
     }
     /// Protocol that will be proxied: tcp, udp. (default: tcp)
     ["-p" | "--protocol", p] => {
@@ -96,7 +100,7 @@ argwerk::define! {
         pub listen_addr: SocketAddr = "[::]:443".parse().unwrap(),
         #[required = "must specify an address to reverse proxy to"]
         pub forward_addr: SocketAddr,
-        pub listeners: u32 = 1,
+        pub listeners: u32 = 0,
         pub close_after: Duration = Duration::from_secs(60),
         pub protocol: Protocol = Protocol::Tcp
     }
@@ -113,9 +117,12 @@ argwerk::define! {
     ["-f" | "--forward-addr", string] => {
         forward_addr = Some(string.parse()?);
     }
-    /// Number of listener sockets that will be opened for the listen address. (Linux 3.9+) (default: 1)
+    /// Number of listener sockets that will be opened for the listen address. 0 to automatically choose to a reasonable number. (Linux 3.9+) (default: 0)
     ["--listeners", n] => {
         listeners = str::parse(&n)?;
+        if listeners == 0 {
+            listeners = available_parallelism().unwrap_or(NonZero::new(1).unwrap()).get() as u32;
+        }
     }
     /// Number of seconds after which UDP socket will be cleaned up. (default: 60)
     ["-c" | "--close-after", n] => {

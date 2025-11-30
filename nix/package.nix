@@ -7,7 +7,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   src = ../.;
 
-  cargoHash = "sha256-YeaQSdwkGC5u7/PtkNwPygd2/golTG3AoNdYwp0useI=";
+  cargoHash = "sha256-MmLKVWRjIu/z5uB/j07oF8jpPFlC+B9SemltgCKoCgI=";
 
   meta = {
     mainProgram = "mmproxy";

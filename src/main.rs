@@ -4,7 +4,7 @@ mod pipe;
 mod util;
 
 use env_logger::{Env, DEFAULT_FILTER_ENV};
-use listener::{tcp_mmproxy, udp_mmproxy, tcp_reverseproxy, udp_reverseproxy};
+use listener::{tcp_mmproxy, udp_mmproxy, udp_reverseproxy};
 
 #[tokio::main]
 async fn main() {

@@ -1,3 +1,4 @@
+use dashmap::Entry;
 use simple_eyre::eyre::{eyre, Result, WrapErr};
 
 use crate::{
@@ -13,31 +14,27 @@ use std::{
         Arc, atomic::Ordering
     },
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
 
 pub async fn listen(args: ArgsMmproxy) -> Result<()> {
-    let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
-
-    let mut buffer = [0u8; MAX_DGRAM_SIZE];
-    let mut connections = ConnectionsHashMap::new();
+    let connections = Arc::new(ConnectionsHashMap::new());
     let (tx, mut rx) = mpsc::channel::<SocketAddr>(128);
 
-    log::info!("mmproxy listening on: {}", args.listen_addr);
-    loop {
-        tokio::select! {
-            // close inactive connections in this branch
-            addr = rx.recv() => {
-                if let Some(addr) = addr {
-                    if let Some((_conn, handle)) = connections.remove(&addr) {
-                        log::info!("closing {addr} due to inactivity");
-                        handle.abort();
-                    }
-                }
-            }
-            // handle incoming DGRAM packets in this branch
-            ret = socket.recv_from(&mut buffer) => {
-                let (read, addr) = ret.wrap_err("failed to accept connection")?;
+    log::info!("mmproxy listening on: {}, {} listeners", args.listen_addr, args.listeners);
+    
+    let mut workers = JoinSet::<Result<()>>::new();
 
+    for _i in 0..args.listeners {
+        let args = args.clone();
+        let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
+        let connections = connections.clone();
+        let mut buffer = [0u8; MAX_DGRAM_SIZE];
+        let tx = tx.clone();
+
+        workers.spawn(async move {
+            loop {
+                let (read, addr) = socket.recv_from(&mut buffer).await.wrap_err("failed to accept connection")?;
+ 
                 if let Some(ref allowed_subnets) = args.allowed_subnets {
                     let ip_addr = addr.ip();
 
@@ -52,12 +49,31 @@ pub async fn listen(args: ArgsMmproxy) -> Result<()> {
                     socket.clone(),
                     addr,
                     &mut buffer[..read],
-                    &mut connections,
+                    connections.clone(),
                     tx.clone(),
                 )
                 .await
                 {
                     log::error!("{why:#}");
+                }
+            }
+        });
+    }
+
+    loop {
+        tokio::select! {
+            // close inactive connections in this branch
+            addr = rx.recv() => {
+                if let Some(addr) = addr {
+                    if let Some((addr, (_dst, handle))) = connections.remove(&addr) {
+                        log::info!("closing {addr} due to inactivity");
+                        handle.abort();
+                    }
+                }
+            },
+            Some(worker) = workers.join_next() => {
+                if let Err(why) = worker {
+                    log::error!("{why:#}")
                 }
             }
         }
@@ -69,7 +85,7 @@ async fn udp_handle_connection(
     src: Arc<UdpSocket>,
     addr: SocketAddr,
     buffer: &mut [u8],
-    connections: &mut ConnectionsHashMap,
+    connections: Arc<ConnectionsHashMap>,
     tx: mpsc::Sender<SocketAddr>,
 ) -> Result<()> {
     let (src_addr, rest, version) = match util::parse_proxy_protocol_header(buffer) {
@@ -91,13 +107,13 @@ async fn udp_handle_connection(
         SocketAddr::V6(_) => args.ipv6_fwd,
     };
 
-    let dst = match connections.get(&addr) {
-        Some((dst, _handle)) => {
+    let dst = match connections.entry(addr) {
+        Entry::Occupied(entry) => {
+            let dst = entry.get().0.clone();
             dst.last_activity.fetch_add(1, Ordering::SeqCst);
-            dst.clone()
+            dst
         }
-        // first time connecting
-        None => {
+        Entry::Vacant(entry) => {
             if src_addr == addr {
                 log::debug!("unknown source, using the downstream connection address");
             }
@@ -125,7 +141,7 @@ async fn udp_handle_connection(
                 dst.clone(),
             ));
 
-            connections.insert(addr, (dst.clone(), handle));
+            entry.insert((dst.clone(), handle));
             dst
         }
     };

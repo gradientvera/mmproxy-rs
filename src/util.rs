@@ -1,7 +1,8 @@
+use dashmap::DashMap;
 use simple_eyre::eyre::{Result, WrapErr, eyre};
 
 use std::{
-    collections::HashMap, fs::File, io::{self, Read}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration
+    fs::File, io::{self, Read}, net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration
 };
 
 use proxy_protocol::{ProxyHeader, version1 as v1, version2::{self as v2, ProxyAddresses}};
@@ -10,7 +11,7 @@ use tokio::{net::{TcpSocket, TcpStream, UdpSocket}, sync::mpsc, task::JoinHandle
 
 pub const MAX_DGRAM_SIZE: usize = 65_507;
 
-pub type ConnectionsHashMap = HashMap<SocketAddr, (Arc<UdpProxyConn>, JoinHandle<()>)>;
+pub type ConnectionsHashMap = DashMap<SocketAddr, (Arc<UdpProxyConn>, JoinHandle<()>)>;
 
 // this is returned from `util::parse_proxy_protocol_header` function
 pub type ProxyProtocolResult<'a> = io::Result<(Option<(SocketAddr, SocketAddr)>, &'a [u8], i32)>;
@@ -250,7 +251,7 @@ fn proxy_protocol_get_dest_v6(addr: SocketAddr) -> SocketAddrV6 {
 
 #[derive(Debug)]
 pub struct UdpProxyConn {
-    pub sock: UdpSocket,
+    pub sock: Arc<UdpSocket>,
     pub last_activity: AtomicU64,
     pub pp_header: Arc<Vec<u8>>,
 }
@@ -258,7 +259,7 @@ pub struct UdpProxyConn {
 impl UdpProxyConn {
     pub fn new(sock: UdpSocket, pp_header: Vec<u8>) -> Self {
         Self {
-            sock,
+            sock: Arc::new(sock),
             last_activity: AtomicU64::new(0),
             pp_header: Arc::new(pp_header),
         }

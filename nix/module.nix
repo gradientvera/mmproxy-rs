@@ -66,9 +66,9 @@ in
 
           listeners = lib.mkOption {
             type = lib.types.int;
-            default = 1;
+            default = 0;
             example = 10;
-            description = "Number of listener sockets that will be opened for the listen address";
+            description = "Number of listener sockets that will be opened for the listen address. 0 to automatically choose to a reasonable number";
           };
 
           protocol = lib.mkOption {
