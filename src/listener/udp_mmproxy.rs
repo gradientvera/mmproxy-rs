@@ -99,10 +99,36 @@ async fn udp_handle_connection(
                     res = src_sock.recv(&mut buffer_src) => {
                         match res {
                             Ok(size) => {
-                                if size > 0 && let Err(e) = dst_sock.send(&buffer_src[..size]).await {
-                                    log::info!("closing {addr} due to destination connection error: {e:#}");
-                                    quit.cancel();
-                                    return;
+                                if size > 0 {
+                                    let (new_src_addr, rest, version) = match util::parse_proxy_protocol_header(&buffer_src[..size]) {
+                                        Ok((addr_pair, rest, version)) => match addr_pair {
+                                            Some((src, _)) => (src, rest, version),
+                                            None => (addr, rest, version),
+                                        },
+                                        Err(e) => {
+                                            log::info!("closing {addr} due to PROXY protocol parse error: {e:#}");
+                                            quit.cancel();
+                                            return;
+                                        },
+                                    };
+
+                                    if new_src_addr != src_addr {
+                                        log::info!("closing {addr} due to source address changing");
+                                        quit.cancel();
+                                        return;
+                                    }
+
+                                    if version < 2 {
+                                        log::info!("closing {addr} because PROXY protocol version 1 doesn't support UDP connections");
+                                        quit.cancel();
+                                        return;
+                                    }
+                                    
+                                    if let Err(e) = dst_sock.send(&rest).await {
+                                        log::info!("closing {addr} due to destination connection error: {e:#}");
+                                        quit.cancel();
+                                        return;
+                                    }
                                 }
                             },
                             Err(why) => {

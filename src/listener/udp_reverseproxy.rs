@@ -57,16 +57,20 @@ async fn udp_handle_connection(
         command: version2::ProxyCommand::Proxy,
         transport_protocol: version2::ProxyTransportProtocol::Datagram,
     };
-    let pp_buffer = proxy_protocol::encode(pp_header).wrap_err("failed to encode PROXY protocol header!")?.to_vec();
+    let pp_buffer = Arc::new(proxy_protocol::encode(pp_header).wrap_err("failed to encode PROXY protocol header!")?);
     let dst_sock = util::udp_create_reverse_proxy_conn(args.forward_addr).await?;
     
-    dst_sock.send(&pp_buffer).await.wrap_err("failed to send PROXY protocol header handshake")?;
-    dst_sock.send(&buffer).await.wrap_err("failed to send initial data buffer")?;
+    let mut send_buffer: Vec<u8> = Vec::with_capacity(pp_buffer.len() + buffer.len());
+    send_buffer.extend_from_slice(&pp_buffer);
+    send_buffer.extend_from_slice(buffer);
+
+    dst_sock.send(&send_buffer).await.wrap_err("failed to send initial data buffer")?;
 
     let activity = Arc::new(Notify::new());
     let quit = CancellationToken::new();
 
     for _i in 0..num_cpus::get() {
+        let pp_buffer = pp_buffer.clone();
         let dst_sock = dst_sock.clone();
         let activity = activity.clone();
         let quit = quit.clone();
@@ -84,7 +88,12 @@ async fn udp_handle_connection(
                     res = src_sock.recv(&mut buffer_src) => {
                         match res {
                             Ok(size) => {
-                                if size > 0 && let Err(e) = dst_sock.send(&buffer_src[..size]).await {
+                                let buffer = &buffer_src[..size];
+                                let mut send_buffer: Vec<u8> = Vec::with_capacity(pp_buffer.len() + buffer.len());
+                                send_buffer.extend_from_slice(&pp_buffer);
+                                send_buffer.extend_from_slice(buffer);
+
+                                if size > 0 && let Err(e) = dst_sock.send(&send_buffer).await {
                                     log::info!("closing {addr} due to destination connection error: {e:#}");
                                     quit.cancel();
                                     return;
