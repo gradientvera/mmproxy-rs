@@ -35,7 +35,7 @@ pub async fn listen(args: ArgsReverseProxy) -> Result<()> {
                 continue;
             }
 
-            if let Err(why) = udp_handle_connection(&args, addr, &mut buffer, connections.clone()).await {
+            if let Err(why) = udp_handle_connection(&args, addr, &mut buffer[..read], connections.clone()).await {
                 log::error!("{why:#}");
             };
         }
