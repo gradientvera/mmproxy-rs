@@ -3,11 +3,11 @@
 }:
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "mmproxy-rs";
-  version = "unstable-2025-11-28";
+  version = "unstable-2025-12-14";
 
   src = ../.;
 
-  cargoHash = "sha256-YeaQSdwkGC5u7/PtkNwPygd2/golTG3AoNdYwp0useI=";
+  cargoHash = "sha256-btreDkxlLeyufk8V8Z0uCabBcx39awDvnEy3vsJDXUA=";
 
   meta = {
     mainProgram = "mmproxy";
