@@ -1,11 +1,12 @@
 use proxy_protocol::{ProxyHeader, version2};
 use simple_eyre::eyre::{Result, WrapErr};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     args::ArgsReverseProxy,
     util::{
-        self, ConnectionsHashMap, MAX_DGRAM_SIZE, UdpProxyConn,
-        udp_close_after_inactivity, udp_dst_to_src, make_proxy_protocol_addresses
+        self, ConnectionsHashMap, MAX_DGRAM_SIZE,
+        make_proxy_protocol_addresses
     },
 };
 use std::{
@@ -14,107 +15,135 @@ use std::{
         Arc, atomic::Ordering
     },
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{net::UdpSocket, sync::{Notify, RwLock, mpsc}, time};
+
 
 pub async fn listen(args: ArgsReverseProxy) -> Result<()> {
-    let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
+    let socket = util::bind_udp_socket(args.listen_addr).await?;
 
     let mut buffer = [0u8; MAX_DGRAM_SIZE];
-    let mut connections = ConnectionsHashMap::new();
-    let (tx, mut rx) = mpsc::channel::<SocketAddr>(128);
+    let connections = Arc::new(RwLock::new(ConnectionsHashMap::new()));
 
-    log::info!("reverse proxy listening on: {}", args.listen_addr);
-    loop {
-        tokio::select! {
-            // close inactive connections in this branch
-            addr = rx.recv() => {
-                if let Some(addr) = addr {
-                    if let Some((_conn, handle)) = connections.remove(&addr) {
-                        log::info!("closing {addr} due to inactivity");
-                        handle.abort();
-                    }
-                }
-            }
-            // handle incoming DGRAM packets in this branch
-            ret = socket.recv_from(&mut buffer) => {
-                let (read, addr) = ret.wrap_err("failed to accept connection")?;
+    log::info!("mmproxy listening on: {}", args.listen_addr);
 
-                if let Err(why) = udp_handle_connection(
-                    &args,
-                    socket.clone(),
-                    addr,
-                    &buffer[..read],
-                    &mut connections,
-                    tx.clone(),
-                )
-                .await
-                {
-                    log::error!("{why:#}")
-                }
+    let main_loop = tokio::spawn(async move {
+        loop {
+            let (read, addr) = socket.recv_from(&mut buffer).await.wrap_err("failed to accept connection")?;
+
+            if let Some(conn) = connections.read().await.get(&addr) {
+                conn.send(&buffer[..read]).await.wrap_err("failed to send data to upstream socket")?;
+                continue;
             }
+
+            if let Err(why) = udp_handle_connection(&args, addr, &mut buffer, connections.clone()).await {
+                log::error!("{why:#}");
+            };
         }
-    }
+    });
+    
+    tokio::join!(main_loop).0?
 }
 
 async fn udp_handle_connection(
     args: &ArgsReverseProxy,
-    src: Arc<UdpSocket>,
-    src_addr: SocketAddr,
-    buffer: &[u8],
-    connections: &mut ConnectionsHashMap,
-    tx: mpsc::Sender<SocketAddr>,
+    addr: SocketAddr,
+    buffer: &mut [u8],
+    connections: Arc<RwLock<ConnectionsHashMap>>
 ) -> Result<()> {
-    let dst = match connections.get(&src_addr) {
-        Some((dst, _handle)) => {
-            dst.last_activity.fetch_add(1, Ordering::SeqCst);
-            dst.clone()
-        }
-        // first time connecting
-        None => {
-            log::info!("[new conn] [src: {src_addr}]");
-
-            let dst = {
-                let pp_header = ProxyHeader::Version2 {
-                    addresses: make_proxy_protocol_addresses(src_addr, args.forward_addr),
-                    command: version2::ProxyCommand::Proxy,
-                    transport_protocol: version2::ProxyTransportProtocol::Datagram,
-                };
-                let pp_buffer = proxy_protocol::encode(pp_header).wrap_err("failed to encode PROXY protocol header!")?.to_vec();
-                let sock = util::udp_create_reverse_proxy_conn(args.forward_addr).await?;
-                Arc::new(UdpProxyConn::new(sock, pp_buffer))
-            };
-
-            let src_clone = src.clone();
-            let dst_clone = dst.clone();
-            let handle = tokio::spawn(async move {
-                if let Err(why) = udp_dst_to_src(src_addr, src_clone, dst_clone).await {
-                    log::error!("{why:#}");
-                };
-            });
-            tokio::spawn(udp_close_after_inactivity(
-                src_addr,
-                args.close_after,
-                tx.clone(),
-                dst.clone(),
-            ));
-
-            connections.insert(src_addr, (dst.clone(), handle));
-            dst
-        }
+    let pp_header = ProxyHeader::Version2 {
+        addresses: make_proxy_protocol_addresses(addr, args.forward_addr),
+        command: version2::ProxyCommand::Proxy,
+        transport_protocol: version2::ProxyTransportProtocol::Datagram,
     };
+    let pp_buffer = proxy_protocol::encode(pp_header).wrap_err("failed to encode PROXY protocol header!")?.to_vec();
+    let dst_sock = util::udp_create_reverse_proxy_conn(args.forward_addr).await?;
+    
+    dst_sock.send(&pp_buffer).await.wrap_err("failed to send PROXY protocol header handshake")?;
+    dst_sock.send(&buffer).await.wrap_err("failed to send initial data buffer")?;
 
-    let mut send_buffer: Vec<u8> = Vec::with_capacity(dst.pp_header.len() + buffer.len());
-    send_buffer.extend_from_slice(&dst.pp_header);
-    send_buffer.extend_from_slice(buffer);
+    let activity = Arc::new(Notify::new());
+    let quit = CancellationToken::new();
 
-    match dst.sock.send(&send_buffer).await {
-        Ok(size) => {
-            if size != send_buffer.len() {
-                log::warn!("sent {} bytes to [{}] but received {} bytes from [{}]!", size, dst.sock.peer_addr().unwrap(), send_buffer.len(), src_addr);
+    for _i in 0..num_cpus::get() {
+        let dst_sock = dst_sock.clone();
+        let activity = activity.clone();
+        let quit = quit.clone();
+
+        let listen_addr = args.listen_addr;
+        tokio::spawn(async move {
+            let mut buffer_src = [0u8; MAX_DGRAM_SIZE];
+            let mut buffer_dst = [0u8; MAX_DGRAM_SIZE];
+
+            let src_sock = util::bind_udp_socket(listen_addr).await.wrap_err("failed to bind new client socket").unwrap();
+            src_sock.connect(addr).await.wrap_err("failed to connect to remote client address").unwrap();
+
+            loop {
+                tokio::select! {
+                    res = src_sock.recv(&mut buffer_src) => {
+                        match res {
+                            Ok(size) => {
+                                if size > 0 && let Err(e) = dst_sock.send(&buffer_src[..size]).await {
+                                    log::info!("closing {addr} due to destination connection error: {e:#}");
+                                    quit.cancel();
+                                    return;
+                                }
+                            },
+                            Err(why) => {
+                                log::info!("closing {addr} due to source connection error: {why:#}");
+                                quit.cancel();
+                                return;
+                            },
+                        }
+                        activity.notify_one();
+                    },
+                    res = dst_sock.recv(&mut buffer_dst) => {
+                        match res {
+                            Ok(size) => {
+                                if size > 0 && let Err(e) = src_sock.send(&buffer_dst[..size]).await {
+                                    log::info!("closing {addr} due to source connection error: {e:#}");
+                                    quit.cancel();
+                                    return;
+                                }
+                            },
+                            Err(why) => {
+                                log::info!("closing {addr} due to destination connection error: {why:#}");
+                                quit.cancel();
+                                return;
+                            },
+                        }
+                        activity.notify_one();
+                    },
+                    _ = quit.cancelled() => {
+                        return;
+                    }
+                }
             }
-            log::debug!("from [{}] to [{}], size: {}", src_addr, args.forward_addr, size);
-            Ok(())
-        }
-        Err(err) => Err(err).wrap_err("failed to write data to the upstream connection"),
+        });
     }
+
+    let sleep = args.close_after;
+    let connections = connections.clone();
+    tokio::spawn(async move {
+        loop {
+            let read_timeout = time::sleep(sleep);
+            let activity_received = activity.notified();
+
+            tokio::select! {
+                _ = read_timeout => {
+                    log::info!("closing {addr} due to inactivity");
+                    connections.write().await.remove(&addr);
+                    quit.cancel();
+                    return;
+                },
+                _ = quit.cancelled() => {
+                    connections.write().await.remove(&addr);
+                    quit.cancel();
+                    return;
+                },
+                _ = activity_received => {}
+            }
+        }
+    });
+
+    Ok(())
 }

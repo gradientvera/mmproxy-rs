@@ -3,7 +3,7 @@ name = "mmproxy"
 description = "Rust implementation of mmproxy (TCP + UDP)"
 repository = "https://github.com/saiko-tech/mmproxy-rs"
 version = "0.2.2"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [dependencies]
@@ -16,3 +16,5 @@ libc = "0.2"
 simple-eyre = "0.3"
 socket2 = { version = "0.5", features = [ "all" ] }
 tokio = { version = "1.48", features = [ "net", "rt-multi-thread", "macros", "io-util", "sync", "time" ] }
+num_cpus = "1.17.0"
+tokio-util = "0.7.17"

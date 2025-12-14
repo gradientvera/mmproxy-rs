@@ -3,8 +3,7 @@ use simple_eyre::eyre::{eyre, Result, WrapErr};
 use crate::{
     args::ArgsMmproxy,
     util::{
-        self, MAX_DGRAM_SIZE, ConnectionsHashMap, UdpProxyConn,
-        udp_dst_to_src, udp_close_after_inactivity
+        self, MAX_DGRAM_SIZE, ConnectionsHashMap,
     },
 };
 use std::{
@@ -13,66 +12,51 @@ use std::{
         Arc, atomic::Ordering
     },
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{net::UdpSocket, sync::{Notify, RwLock, mpsc}, time};
+use tokio_util::sync::CancellationToken;
 
 pub async fn listen(args: ArgsMmproxy) -> Result<()> {
-    let socket = util::bind_udp_socket(args.listen_addr, args.listeners).await?;
+    let socket = util::bind_udp_socket(args.listen_addr).await?;
 
     let mut buffer = [0u8; MAX_DGRAM_SIZE];
-    let mut connections = ConnectionsHashMap::new();
-    let (tx, mut rx) = mpsc::channel::<SocketAddr>(128);
+    let connections = Arc::new(RwLock::new(ConnectionsHashMap::new()));
 
     log::info!("mmproxy listening on: {}", args.listen_addr);
-    loop {
-        tokio::select! {
-            // close inactive connections in this branch
-            addr = rx.recv() => {
-                if let Some(addr) = addr {
-                    if let Some((_conn, handle)) = connections.remove(&addr) {
-                        log::info!("closing {addr} due to inactivity");
-                        handle.abort();
-                    }
+
+    let main_loop = tokio::spawn(async move {
+        loop {
+            let (read, addr) = socket.recv_from(&mut buffer).await.wrap_err("failed to accept connection")?;
+            
+            if let Some(ref allowed_subnets) = args.allowed_subnets {
+                let ip_addr = addr.ip();
+
+                if !util::check_origin_allowed(&ip_addr, allowed_subnets) {
+                    log::warn!("connection origin is not allowed: {ip_addr}");
+                    continue;
                 }
             }
-            // handle incoming DGRAM packets in this branch
-            ret = socket.recv_from(&mut buffer) => {
-                let (read, addr) = ret.wrap_err("failed to accept connection")?;
 
-                if let Some(ref allowed_subnets) = args.allowed_subnets {
-                    let ip_addr = addr.ip();
-
-                    if !util::check_origin_allowed(&ip_addr, allowed_subnets) {
-                        log::warn!("connection origin is not allowed: {ip_addr}");
-                        continue;
-                    }
-                }
-
-                if let Err(why) = udp_handle_connection(
-                    &args,
-                    socket.clone(),
-                    addr,
-                    &mut buffer[..read],
-                    &mut connections,
-                    tx.clone(),
-                )
-                .await
-                {
-                    log::error!("{why:#}");
-                }
+            if let Some(conn) = connections.read().await.get(&addr) {
+                conn.send(&buffer[..read]).await.wrap_err("failed to send data to upstream socket")?;
+                continue;
             }
+
+            if let Err(why) = udp_handle_connection(&args, addr, &mut buffer, connections.clone()).await {
+                log::error!("{why:#}");
+            };
         }
-    }
+    });
+    
+    tokio::join!(main_loop).0?
 }
 
 async fn udp_handle_connection(
     args: &ArgsMmproxy,
-    src: Arc<UdpSocket>,
     addr: SocketAddr,
     buffer: &mut [u8],
-    connections: &mut ConnectionsHashMap,
-    tx: mpsc::Sender<SocketAddr>,
+    connections: Arc<RwLock<ConnectionsHashMap>>
 ) -> Result<()> {
-    let (src_addr, rest, version) = match util::parse_proxy_protocol_header(buffer) {
+    let (src_addr, _, version) = match util::parse_proxy_protocol_header(&buffer) {
         Ok((addr_pair, rest, version)) => match addr_pair {
             Some((src, _)) => (src, rest, version),
             None => (addr, rest, version),
@@ -91,53 +75,90 @@ async fn udp_handle_connection(
         SocketAddr::V6(_) => args.ipv6_fwd,
     };
 
-    let dst = match connections.get(&addr) {
-        Some((dst, _handle)) => {
-            dst.last_activity.fetch_add(1, Ordering::SeqCst);
-            dst.clone()
-        }
-        // first time connecting
-        None => {
-            if src_addr == addr {
-                log::debug!("unknown source, using the downstream connection address");
+    let dst_sock = util::udp_create_upstream_conn(addr, target_addr, args.mark).await.wrap_err("failed to create upstream socket")?;
+    let activity = Arc::new(Notify::new());
+    let quit = CancellationToken::new();
+
+    for _i in 0..num_cpus::get() {
+        let dst_sock = dst_sock.clone();
+        let activity = activity.clone();
+        let quit = quit.clone();
+
+        let listen_addr = args.listen_addr;
+        tokio::spawn(async move {
+            let mut buffer_src = [0u8; MAX_DGRAM_SIZE];
+            let mut buffer_dst = [0u8; MAX_DGRAM_SIZE];
+
+            let src_sock = util::bind_udp_socket(listen_addr).await.wrap_err("failed to bind new client socket").unwrap();
+            src_sock.connect(addr).await.wrap_err("failed to connect to remote client address").unwrap();
+
+            loop {
+                tokio::select! {
+                    res = src_sock.recv(&mut buffer_src) => {
+                        match res {
+                            Ok(size) => {
+                                if size > 0 && let Err(e) = dst_sock.send(&buffer_src[..size]).await {
+                                    log::info!("closing {addr} due to destination connection error: {e:#}");
+                                    quit.cancel();
+                                    return;
+                                }
+                            },
+                            Err(why) => {
+                                log::info!("closing {addr} due to source connection error: {why:#}");
+                                quit.cancel();
+                                return;
+                            },
+                        }
+                        activity.notify_one();
+                    },
+                    res = dst_sock.recv(&mut buffer_dst) => {
+                        match res {
+                            Ok(size) => {
+                                if size > 0 && let Err(e) = src_sock.send(&buffer_dst[..size]).await {
+                                    log::info!("closing {addr} due to source connection error: {e:#}");
+                                    quit.cancel();
+                                    return;
+                                }
+                            },
+                            Err(why) => {
+                                log::info!("closing {addr} due to destination connection error: {why:#}");
+                                quit.cancel();
+                                return;
+                            },
+                        }
+                        activity.notify_one();
+                    },
+                    _ = quit.cancelled() => {
+                        return;
+                    }
+                }
             }
-
-            log::info!("[new conn] [origin: {addr}] [src: {src_addr}]");
-
-            let dst = {
-                let sock = util::udp_create_upstream_conn(src_addr, target_addr, args.mark).await?;
-                Arc::new(UdpProxyConn::new(sock, vec![]))
-            };
-
-            let src_clone = src.clone();
-            let dst_clone = dst.clone();
-
-            let handle = tokio::spawn(async move {
-                if let Err(why) = udp_dst_to_src(addr, src_clone, dst_clone).await {
-                    log::error!("{why:#}");
-                };
-            });
-
-            tokio::spawn(udp_close_after_inactivity(
-                addr,
-                args.close_after,
-                tx.clone(),
-                dst.clone(),
-            ));
-
-            connections.insert(addr, (dst.clone(), handle));
-            dst
-        }
-    };
-
-    match dst.sock.send(rest).await {
-        Ok(size) => {
-            if size != rest.len() {
-                log::warn!("sent {} bytes to [{}] but received {} bytes from [{}]!", size, target_addr, rest.len(), src_addr);
-            }
-            log::debug!("from [{}] to [{}], size: {}", src_addr, addr, size);
-            Ok(())
-        }
-        Err(err) => Err(err).wrap_err("failed to write data to the upstream connection"),
+        });
     }
+
+    let sleep = args.close_after;
+    let connections = connections.clone();
+    tokio::spawn(async move {
+        loop {
+            let read_timeout = time::sleep(sleep);
+            let activity_received = activity.notified();
+
+            tokio::select! {
+                _ = read_timeout => {
+                    log::info!("closing {addr} due to inactivity");
+                    connections.write().await.remove(&addr);
+                    quit.cancel();
+                    return;
+                },
+                _ = quit.cancelled() => {
+                    connections.write().await.remove(&addr);
+                    quit.cancel();
+                    return;
+                },
+                _ = activity_received => {}
+            }
+        }
+    });
+
+    Ok(())
 }
