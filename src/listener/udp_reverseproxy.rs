@@ -24,7 +24,7 @@ pub async fn listen(args: ArgsReverseProxy) -> Result<()> {
     let mut buffer = [0u8; MAX_DGRAM_SIZE];
     let connections = Arc::new(RwLock::new(ConnectionsHashMap::new()));
 
-    log::info!("mmproxy listening on: {}", args.listen_addr);
+    log::info!("reverse proxy listening on: {}", args.listen_addr);
 
     let main_loop = tokio::spawn(async move {
         loop {
