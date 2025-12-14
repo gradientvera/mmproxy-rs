@@ -50,6 +50,8 @@ async fn udp_handle_connection(
     buffer: &mut [u8],
     connections: Arc<RwLock<ConnectionsHashMap>>
 ) -> Result<()> {
+    log::info!("[new conn] [origin: {addr}]");
+
     let pp_header = ProxyHeader::Version2 {
         addresses: make_proxy_protocol_addresses(addr, args.forward_addr),
         command: version2::ProxyCommand::Proxy,

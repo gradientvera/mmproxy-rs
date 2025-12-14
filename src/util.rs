@@ -133,7 +133,7 @@ pub async fn udp_create_upstream_conn(
     udp_socket
         .connect(target)
         .await
-        .wrap_err("failed to connecto to the upstream server")?;
+        .wrap_err("failed to connect to the upstream server")?;
 
     Ok(Arc::new(udp_socket))
 }
@@ -152,7 +152,7 @@ pub async fn udp_create_reverse_proxy_conn(
     udp_socket
         .connect(target)
         .await
-        .wrap_err("failed to connecto to the upstream server")?;
+        .wrap_err("failed to connect to the upstream server")?;
 
     Ok(Arc::new(udp_socket))
 }

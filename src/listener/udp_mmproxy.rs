@@ -75,7 +75,9 @@ async fn udp_handle_connection(
         SocketAddr::V6(_) => args.ipv6_fwd,
     };
 
-    let dst_sock = util::udp_create_upstream_conn(addr, target_addr, args.mark).await.wrap_err("failed to create upstream socket")?;
+    log::info!("[new conn] [origin: {addr}] [src: {src_addr}]");
+
+    let dst_sock = util::udp_create_upstream_conn(src_addr, target_addr, args.mark).await.wrap_err("failed to create upstream socket")?;
     let activity = Arc::new(Notify::new());
     let quit = CancellationToken::new();
 
